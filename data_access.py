@@ -9,13 +9,26 @@ Four functions for four data sources:
 
 Usage:
     from data_access import get_data
+    from shapely.geometry import Polygon
 
-    # One function for everything — routes to the right source automatically:
+    # Rectangle (bbox):
     da = get_data("GWS_tavg", "2010-01-01", "2023-12-31", bbox=(76.8, 28.4, 77.4, 28.9))
-    da = get_data("NDVI", "2010-01-01", "2023-12-31", bbox=(76.8, 28.4, 77.4, 28.9))
-    da = get_data("CO2_Mauna_Loa", "2000-01-01", "2023-12-31")  # no bbox needed
+
+    # Arbitrary polygon:
+    poly = Polygon([(76.8, 28.4), (77.4, 28.4), (77.2, 29.0), (76.9, 28.9)])
+    da = get_data("GWS_tavg", "2010-01-01", "2023-12-31", geometry=poly)
+
+    # GeoJSON dict also works:
+    da = get_data("NDVI", "2010-01-01", "2023-12-31", geometry={
+        "type": "Polygon",
+        "coordinates": [[[76.8, 28.4], [77.4, 28.4], [77.2, 29.0], [76.9, 28.9], [76.8, 28.4]]]
+    })
+
+    # Global (no region needed):
+    da = get_data("CO2_Mauna_Loa", "2000-01-01", "2023-12-31")
 """
 
+import math
 import earthaccess
 import xarray as xr
 import numpy as np
@@ -26,7 +39,7 @@ import time
 import os
 import re
 import tempfile
-from shapely.geometry import box
+from shapely.geometry import box, Polygon, MultiPolygon, mapping, shape
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -240,6 +253,26 @@ REGIONS = {
     "sahel": {"name": "Sahel (Niger/Nigeria border)", "bbox": (2.0, 11.0, 10.0, 16.0)},
 }
 
+
+def get_region_params(region_key: str) -> dict:
+    """
+    Return dict with 'bbox' and optionally 'geometry' for passing to get_data().
+
+    Regions may define either a bbox (rectangle) or a geometry (polygon).
+    This helper always returns both when a geometry is present.
+
+    Usage:
+        params = get_region_params("delhi")
+        da = get_data("NO2", "2010-01-01", "2023-12-31", **params)
+    """
+    region = REGIONS[region_key]
+    result = {}
+    if "bbox" in region:
+        result["bbox"] = region["bbox"]
+    if "geometry" in region:
+        result["geometry"] = region["geometry"]
+    return result
+
 # One investigation per phenomenon — the most vivid region
 INVESTIGATIONS = {
     "water_stress": {
@@ -295,11 +328,94 @@ _ea_logged_in = False
 
 
 def _coord_to_indices(coord_cfg, low, high):
-    """Convert coordinate range to grid indices."""
+    """Convert coordinate range to grid indices.
+
+    Returns the exact range of grid cells whose area overlaps [low, high].
+    A cell centered at C with step S covers [C - S/2, C + S/2].
+    """
     start, step = coord_cfg["start"], coord_cfg["step"]
-    i_low = max(0, int((low - start) / step))
-    i_high = min(coord_cfg["n"] - 1, int((high - start) / step))
+    half = step / 2
+    # First cell whose upper edge (center + half) >= low
+    i_low = max(0, math.ceil((low - start - half) / step))
+    # Last cell whose lower edge (center - half) <= high
+    i_high = min(coord_cfg["n"] - 1, math.floor((high - start + half) / step))
     return i_low, i_high
+
+
+def _normalize_region(bbox=None, geometry=None):
+    """
+    Accept bbox and/or geometry, return (bbox_tuple, shapely_geometry).
+
+    - bbox only → geometry is the rectangle
+    - geometry only → bbox is derived from geometry.bounds
+    - both → bbox is used for fetching, geometry for masking
+    - neither → (None, None)
+    """
+    if geometry is not None:
+        if isinstance(geometry, dict):
+            geometry = shape(geometry)
+        if not isinstance(geometry, (Polygon, MultiPolygon)):
+            raise TypeError(f"geometry must be a Polygon or MultiPolygon, got {type(geometry).__name__}")
+        if bbox is None:
+            bbox = geometry.bounds  # (minx, miny, maxx, maxy) = (west, south, east, north)
+        return bbox, geometry
+    if bbox is not None:
+        west, south, east, north = bbox
+        return bbox, box(west, south, east, north)
+    return None, None
+
+
+def _mask_to_geometry(da, geometry):
+    """
+    Mask an xarray.DataArray so that grid cells outside the polygon become NaN.
+
+    Uses cell-intersects logic: a cell is kept if its bounding box overlaps the
+    polygon at all. This is the correct approach for coarse grids (0.25°–0.625°)
+    where center-point containment would discard cells that partially cover the
+    region of interest.
+
+    Requires 'lat' and 'lon' coords on the DataArray.
+    """
+    if geometry is None:
+        return da
+    # If the geometry is a plain rectangle matching the data bbox, skip masking
+    if isinstance(geometry, Polygon) and geometry.equals(box(*geometry.bounds)):
+        return da
+
+    from shapely.prepared import prep
+
+    prepared_geom = prep(geometry)
+    lat_vals = da.lat.values
+    lon_vals = da.lon.values
+
+    # Compute half-steps for cell boundaries
+    if len(lat_vals) > 1:
+        dlat = abs(lat_vals[1] - lat_vals[0]) / 2
+    else:
+        dlat = 0.125  # fallback half-step
+    if len(lon_vals) > 1:
+        dlon = abs(lon_vals[1] - lon_vals[0]) / 2
+    else:
+        dlon = 0.125
+
+    # Build mask: True if the cell bbox intersects the polygon
+    mask = np.zeros((len(lat_vals), len(lon_vals)), dtype=bool)
+    for i, lat in enumerate(lat_vals):
+        for j, lon in enumerate(lon_vals):
+            cell = box(lon - dlon, lat - dlat, lon + dlon, lat + dlat)
+            mask[i, j] = prepared_geom.intersects(cell)
+
+    mask_da = xr.DataArray(mask, dims=["lat", "lon"], coords={"lat": da.lat, "lon": da.lon})
+    return da.where(mask_da)
+
+
+def _geometry_to_geojson_feature(geometry):
+    """Convert a Shapely geometry to a GeoJSON Feature dict."""
+    return {
+        "type": "Feature",
+        "geometry": mapping(geometry),
+        "properties": {},
+    }
 
 
 def _get_opendap_url(granule):
@@ -415,6 +531,7 @@ def get_data(
     start_date: str,
     end_date: str,
     bbox: tuple = None,
+    geometry=None,
 ) -> xr.DataArray:
     """
     Fetch any variable — automatically routes to the right data source.
@@ -423,13 +540,18 @@ def get_data(
         variable: any variable name from list_variables()
         start_date: "YYYY-MM-DD"
         end_date: "YYYY-MM-DD"
-        bbox: (west, south, east, north) — required for gridded data, ignored for NOAA
+        bbox: (west, south, east, north) — required for gridded data, ignored for NOAA.
+              If geometry is provided, bbox is derived automatically.
+        geometry: optional Shapely Polygon/MultiPolygon or GeoJSON dict.
+                  Grid cells outside the polygon are masked to NaN.
 
     Returns:
         xarray.DataArray sorted by time.
     """
     if variable in NOAA_VARIABLES:
         return get_data_noaa(variable, start_date, end_date)
+
+    bbox, geometry = _normalize_region(bbox, geometry)
 
     if bbox is None:
         all_vars = (
@@ -438,14 +560,14 @@ def get_data(
         )
         if variable not in all_vars:
             raise ValueError(f"Unknown variable '{variable}'. Available: {', '.join(all_vars)}")
-        raise ValueError(f"bbox is required for variable '{variable}'")
+        raise ValueError(f"bbox or geometry is required for variable '{variable}'")
 
     if variable in EARTHACCESS_VARIABLES:
-        return get_data_earthaccess(bbox, variable, start_date, end_date)
+        return get_data_earthaccess(bbox, variable, start_date, end_date, geometry=geometry)
     if variable in APPEEARS_VARIABLES:
-        return get_data_appeears(bbox, variable, start_date, end_date)
+        return get_data_appeears(bbox, variable, start_date, end_date, geometry=geometry)
     if variable == "NTL":
-        return get_data_ntl(bbox, start_date, end_date)
+        return get_data_ntl(bbox, start_date, end_date, geometry=geometry)
 
     all_vars = (
         list(EARTHACCESS_VARIABLES) + list(APPEEARS_VARIABLES)
@@ -463,6 +585,7 @@ def get_data_earthaccess(
     variable: str,
     start_date: str,
     end_date: str,
+    geometry=None,
 ) -> xr.DataArray:
     """
     Fetch data via OPeNDAP (server-side subsetting — downloads only the bbox, not full global files).
@@ -472,9 +595,10 @@ def get_data_earthaccess(
         variable: any key from EARTHACCESS_VARIABLES
         start_date: "YYYY-MM-DD"
         end_date: "YYYY-MM-DD"
+        geometry: optional Shapely polygon — cells outside it are masked to NaN
 
     Returns:
-        xarray.DataArray with dims (time, lat, lon), subsetted to bbox.
+        xarray.DataArray with dims (time, lat, lon), subsetted to bbox and optionally masked.
     """
     if variable not in EARTHACCESS_VARIABLES:
         available = ", ".join(EARTHACCESS_VARIABLES.keys())
@@ -540,6 +664,9 @@ def get_data_earthaccess(
     # Standardize coord names and dim order
     da = _standardize_coords(da, grid, bbox)
 
+    # Mask to polygon if a non-rectangular geometry was provided
+    da = _mask_to_geometry(da, geometry)
+
     print(f"  Done: {da.sizes}")
     return da.sortby("time")
 
@@ -554,6 +681,7 @@ def get_data_appeears(
     start_date: str,
     end_date: str,
     poll_interval: int = 30,
+    geometry=None,
 ) -> xr.DataArray:
     """
     Fetch data via AppEEARS REST API (MODIS products).
@@ -564,6 +692,8 @@ def get_data_appeears(
         start_date: "YYYY-MM-DD"
         end_date: "YYYY-MM-DD"
         poll_interval: seconds between status checks (default 30)
+        geometry: optional Shapely polygon — passed directly to AppEEARS as the
+                  area-of-interest (server-side clipping to the exact shape)
 
     Returns:
         xarray.DataArray with dims (time, lat, lon).
@@ -577,10 +707,26 @@ def get_data_appeears(
     token = _get_appeears_token()
     headers = {"Authorization": f"Bearer {token}"}
 
-    west, south, east, north = bbox
     # Convert dates from YYYY-MM-DD to MM-DD-YYYY (AppEEARS format)
     sd = f"{start_date[5:7]}-{start_date[8:10]}-{start_date[0:4]}"
     ed = f"{end_date[5:7]}-{end_date[8:10]}-{end_date[0:4]}"
+
+    # Build GeoJSON feature — use exact polygon when available, fall back to bbox rect
+    if geometry is not None:
+        geo_feature = _geometry_to_geojson_feature(geometry)
+    else:
+        west, south, east, north = bbox
+        geo_feature = {
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [west, south], [east, south], [east, north],
+                    [west, north], [west, south],
+                ]],
+            },
+            "properties": {},
+        }
 
     task_payload = {
         "task_type": "area",
@@ -591,17 +737,7 @@ def get_data_appeears(
             "output": {"format": {"type": "geotiff"}, "projection": "geographic"},
             "geo": {
                 "type": "FeatureCollection",
-                "features": [{
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "Polygon",
-                        "coordinates": [[
-                            [west, south], [east, south], [east, north],
-                            [west, north], [west, south],
-                        ]],
-                    },
-                    "properties": {},
-                }],
+                "features": [geo_feature],
             },
         },
     }
@@ -692,6 +828,7 @@ def get_data_ntl(
     bbox: tuple,
     start_date: str,
     end_date: str,
+    geometry=None,
 ) -> xr.DataArray:
     """
     Fetch VIIRS nighttime lights via blackmarblepy.
@@ -700,6 +837,7 @@ def get_data_ntl(
         bbox: (west, south, east, north) in degrees
         start_date: "YYYY-MM-DD" (year granularity — uses Jan 1 of each year)
         end_date: "YYYY-MM-DD"
+        geometry: optional Shapely polygon — blackmarblepy clips to this shape natively
 
     Returns:
         xarray.DataArray with dims (time, lat, lon), nighttime light radiance.
@@ -710,8 +848,12 @@ def get_data_ntl(
     if not token:
         raise ValueError("NASA_BEARER_TOKEN not set in .env")
 
-    west, south, east, north = bbox
-    gdf = gpd.GeoDataFrame(geometry=[box(west, south, east, north)], crs="EPSG:4326")
+    # blackmarblepy accepts a GeoDataFrame — use exact polygon when available
+    if geometry is not None:
+        gdf = gpd.GeoDataFrame(geometry=[geometry], crs="EPSG:4326")
+    else:
+        west, south, east, north = bbox
+        gdf = gpd.GeoDataFrame(geometry=[box(west, south, east, north)], crs="EPSG:4326")
 
     date_range = pd.date_range(start_date, end_date, freq="YS")
     if len(date_range) == 0:
